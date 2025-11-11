@@ -1,0 +1,106 @@
+name: Build ORVA APK and Upload to storage
+
+on:
+  push:
+    tags:
+      - '*.*.*-VOICE-RC'  # Trigger for tags ending with -stage
+      - '*.*.*-stage'  # Trigger for tags ending with -stage
+      - '*.*.*-prod'   # Trigger for tags ending with -prod
+
+jobs:
+  build:
+    name: Build APK and Upload to Azure Blob
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout the code
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Step 2: Set up Node.js and JDK
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '22'  # Specify Node.js version 22
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+
+      # Step 3: Create .env file dynamically based on the tag
+      - name: Create environment file based on tag
+        run: |
+          echo $ENV_PRODUCTION_BASE64 | base64 --decode > .env.staging
+          echo $ENV_PRODUCTION_BASE64 | base64 --decode > .env.production
+          echo $ENV_PRODUCTION_BASE64 | base64 --decode > .env
+        env:
+          ENV_STAGING_BASE64: ${{ secrets.ENV_STAGING_BASE64 }}  # Add .env.staging as base64
+          ENV_PRODUCTION_BASE64: ${{ secrets.ENV_PRODUCTION_BASE64 }}  # Add .env.production as base64
+          GITHUB_TAG: ${{github.ref_name}}
+
+      # Step 4: Add release.keystore to android/app
+      - name: Add release.keystore to android/app
+        run: |
+          echo $RELEASE_KEYSTORE_BASE64 | base64 --decode > android/app/release.keystore
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+
+      # Step 7: Set the APK file name with Tag Version and BLOB_FOLDER
+      - name: Set APK file name and BLOB_FOLDER with tag version
+        run: |
+          # Use GITHUB_TAG to directly get the tag name
+          TAG_NAME=${GITHUB_TAG}
+
+          # Extract version from the tag (works for both with and without 'v' prefix)
+          VERSION=$(echo $TAG_NAME | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+')
+
+          # Check if VERSION is empty and exit with error if not found
+          if [ -z "$VERSION" ]; then
+            echo "Error: Version not found in tag $TAG_NAME"
+            exit 1
+          fi
+
+          if [[ "$TAG_NAME" == *"-stage" ]]; then
+            echo "BLOB_FOLDER=app-staging" >> $GITHUB_ENV
+            echo "APK_NAME=app-release-$VERSION-stage.apk" >> $GITHUB_ENV
+          elif [[ "$TAG_NAME" == *"-prod" ]]; then
+            echo "BLOB_FOLDER=app-production" >> $GITHUB_ENV
+            echo "APK_NAME=app-release-$VERSION-prod.apk" >> $GITHUB_ENV
+          else
+            echo "Unknown tag format: $TAG_NAME"
+            exit 1
+          fi
+        shell: bash
+        env:
+          GITHUB_TAG: ${{github.ref_name}}
+
+      # Step 5: Install dependencies using Yarn
+      - name: Install dependencies
+        run: yarn install
+
+      # Step 6: Build APK using yarn buildProdApk
+      - name: Build APK
+        run: yarn buildProdApk
+
+      # Step 8: Upload APK to Azure Blob Storage
+      - name: Upload APK to Azure Blob Storage
+        env:
+          AZURE_STORAGE_ACCOUNT_NAME: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
+          AZURE_STORAGE_ACCOUNT_KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
+          BLOB_FOLDER: ${{ env.BLOB_FOLDER }}  # Ensure BLOB_FOLDER is passed
+          APK_NAME: ${{ env.APK_NAME }}        # Ensure APK_NAME is passed
+          GITHUB_TAG: ${{github.ref_name}}
+        run: |
+          # Install Azure CLI
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+          # Upload APK to the appropriate folder (staging or production)
+          az storage blob upload \
+            --account-name $AZURE_STORAGE_ACCOUNT_NAME \
+            --account-key $AZURE_STORAGE_ACCOUNT_KEY \
+            --container-name $BLOB_FOLDER \
+            --name $APK_NAME \
+            --file ./android/app/build/outputs/apk/production/release/app-production-release.apk \
+            --overwrite
